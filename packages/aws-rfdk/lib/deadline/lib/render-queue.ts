@@ -62,6 +62,7 @@ import {
   IRepository,
   IVersion,
   RenderQueueProps,
+  RenderQueueSizeConstraints,
   VersionQuery,
 } from '.';
 
@@ -78,6 +79,7 @@ import {
 import {
   RenderQueueConnection,
 } from './rq-connection';
+import { Version } from './version';
 import {
   WaitForStableService,
 } from './wait-for-stable-service';
@@ -244,6 +246,14 @@ export class RenderQueue extends RenderQueueBase implements IGrantable {
   private readonly rqConnection: RenderQueueConnection;
 
   /**
+   * Constraints on the number of Deadline RCS processes that can be run as part of this
+   * RenderQueue.
+   *
+   * @default Allow no less than one Deadline RCS to be running.
+   */
+  readonly renderQueueSize: RenderQueueSizeConstraints;
+
+  /**
    * The listener on the ALB that is redirecting traffic to the RCS.
    */
   private readonly listener: ApplicationListener;
@@ -261,14 +271,19 @@ export class RenderQueue extends RenderQueueBase implements IGrantable {
   constructor(scope: Construct, id: string, props: RenderQueueProps) {
     super(scope, id);
 
-    // The RCS does not currently support horizontal scaling behind a load-balancer, so we limit to at most one instance
-    if (props.renderQueueSize && props.renderQueueSize.min !== undefined && props.renderQueueSize.min > 1) {
-      throw new Error(`renderQueueSize.min cannot be greater than 1 - got ${props.renderQueueSize.min}`);
+    const minimumVersion: Version = new Version([10, 1, 10, 0]);
+    if (props.version.isLessThan(minimumVersion)) {
+      // Deadline versions earlier than 10.1.10 do not support horizontal scaling behind a load-balancer, so we limit to at most one instance
+      if (props.renderQueueSize && props.renderQueueSize.min !== undefined && props.renderQueueSize.min > 1) {
+        throw new Error(`renderQueueSize.min for Deadline version less than ${minimumVersion.toString()} cannot be greater than 1 - got ${props.renderQueueSize.min}`);
+      }
+      if (props.renderQueueSize && props.renderQueueSize.desired !== undefined && props.renderQueueSize.desired > 1) {
+        throw new Error(`renderQueueSize.desired for Deadline version less than ${minimumVersion.toString()} cannot be greater than 1 - got ${props.renderQueueSize.desired}`);
+      }
+      if (props.renderQueueSize && props.renderQueueSize.max !== undefined && props.renderQueueSize.max > 1) {
+        throw new Error(`renderQueueSize.max for Deadline version less than ${minimumVersion.toString()} cannot be greater than 1 - got ${props.renderQueueSize.max}`);
+      }
     }
-    if (props.renderQueueSize && props.renderQueueSize.desired !== undefined && props.renderQueueSize.desired > 1) {
-      throw new Error(`renderQueueSize.desired cannot be greater than 1 - got ${props.renderQueueSize.desired}`);
-    }
-
     this.version = props?.version;
 
     let externalProtocol: ApplicationProtocol;
@@ -297,6 +312,8 @@ export class RenderQueue extends RenderQueueBase implements IGrantable {
 
     this.version = props.version;
 
+    this.renderQueueSize = props?.renderQueueSize ?? {min: 1, max: 1};
+
     const internalProtocol = props.trafficEncryption?.internalProtocol ?? ApplicationProtocol.HTTPS;
 
     if (externalProtocol === ApplicationProtocol.HTTPS && !props.hostname) {
@@ -307,16 +324,20 @@ export class RenderQueue extends RenderQueueBase implements IGrantable {
       vpc: props.vpc,
     });
 
-    const minCapacity = props.renderQueueSize?.min ?? 1;
+    const minCapacity = this.renderQueueSize?.min ?? 1;
     if (minCapacity < 1) {
       throw new Error(`renderQueueSize.min capacity must be at least 1: got ${minCapacity}`);
+    }
+    const maxCapacity = this.renderQueueSize.max ?? this.renderQueueSize?.desired;
+    if (this.renderQueueSize?.desired && maxCapacity && this.renderQueueSize?.desired > maxCapacity) {
+      throw new Error(`renderQueueSize.desired capacity can not be more than ${maxCapacity}: got ${this.renderQueueSize.desired}`);
     }
     this.asg = this.cluster.addCapacity('RCS Capacity', {
       vpcSubnets: props.vpcSubnets ?? { subnetType: SubnetType.PRIVATE },
       instanceType: props.instanceType ?? new InstanceType('c5.large'),
       minCapacity,
-      desiredCapacity: props.renderQueueSize?.desired,
-      maxCapacity: 1,
+      desiredCapacity: this.renderQueueSize?.desired,
+      maxCapacity,
       blockDevices: [{
         deviceName: '/dev/xvda',
         // See: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-ami-storage-config.html
@@ -375,7 +396,7 @@ export class RenderQueue extends RenderQueueBase implements IGrantable {
     this.pattern = new ApplicationLoadBalancedEc2Service(this, 'AlbEc2ServicePattern', {
       certificate: this.clientCert,
       cluster: this.cluster,
-      desiredCount: props.renderQueueSize?.desired,
+      desiredCount: this.renderQueueSize?.desired,
       domainZone: props.hostname?.zone,
       domainName: loadBalancerFQDN,
       listenerPort: externalPortNumber,
